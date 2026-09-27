@@ -1,0 +1,56 @@
+name: Validate PR 41387 ROCm Docker build
+
+on:
+  push:
+    branches:
+      - codex/pr-41387-rocm-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: amd-docker-scale
+    timeout-minutes: 240
+    steps:
+      - name: Checkout PR commit
+        uses: actions/checkout@v4
+        with:
+          ref: 4977123ccd45c6e4c84f488348b00cd385f6470d
+          fetch-depth: 0
+
+      - name: Verify checked out commit
+        run: test "$(git rev-parse HEAD)" = "4977123ccd45c6e4c84f488348b00cd385f6470d"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+          test -n "$VERSION"
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "pretend_version=${VERSION}.dev$(date +%Y%m%d)+g${COMMIT_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Build full gfx942 ROCm 7.2 image
+        run: |
+          docker build . -f docker/rocm.Dockerfile \
+            --build-arg SGL_BRANCH=4977123ccd45c6e4c84f488348b00cd385f6470d \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GPU_ARCH=gfx942-rocm720 \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.pretend_version }}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t sglang-rocm-pr41387:gfx942-rocm720 \
+            --no-cache
+
+      - name: Check TileLang in final image
+        run: |
+          docker run --rm --entrypoint /opt/venv/bin/python \
+            sglang-rocm-pr41387:gfx942-rocm720 \
+            -c 'import tilelang; print(tilelang.__version__)'
