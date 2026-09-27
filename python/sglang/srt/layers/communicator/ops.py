@@ -41,8 +41,8 @@ from sglang.srt.layers.communicator.layout import (
     moe_cp_gathered_rows,
 )
 from sglang.srt.layers.communicator.output import UnreducedOutput, reduce_output
-from sglang.srt.layers.communicator.residual import ResidualOps
-from sglang.srt.layers.communicator.residual.add_norm import ADD_AND_NORM
+from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
+from sglang.srt.layers.communicator.residual.add_norm import ADD, NORM_READ
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
@@ -248,10 +248,11 @@ def _mlp_input_without_dp(
     *,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
-    residual_ops: ResidualOps = ADD_AND_NORM,
+    read: StageRead = NORM_READ,
+    update: StageUpdate = ADD,
 ):
     if gathers_residual:
-        residual = residual_ops.residual_from_attn_tp_shards(residual)
+        residual = update.residual_from_attn_tp_shards(residual)
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
@@ -259,7 +260,7 @@ def _mlp_input_without_dp(
     hidden_states = _mlp_input_reduce_output(hidden_states, forward_batch)
     if _is_npu and context.cache is not None:
         _ = prepare_weight_cache(hidden_states, context.cache)
-    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
+    return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
 def _mlp_input_dp_replicate(
@@ -272,14 +273,15 @@ def _mlp_input_dp_replicate(
     gathers_residual: bool,
     reduces_attention_tp: bool,
     places_cp_shards: bool = False,
-    residual_ops: ResidualOps = ADD_AND_NORM,
+    read: StageRead = NORM_READ,
+    update: StageUpdate = ADD,
 ):
     """Attention DP: complete the attention-TP sum if it is owed, write the
     output into the residual and read the FFN input locally, then gather. With
     ``places_cp_shards`` each CP rank puts its shard of the DP group's tokens
     beside the others' in the group's slot."""
     if gathers_residual:
-        residual = residual_ops.residual_from_attn_tp_shards(residual)
+        residual = update.residual_from_attn_tp_shards(residual)
     if hidden_states.shape[0] != 0:
         if reduces_attention_tp:
             hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
@@ -287,12 +289,12 @@ def _mlp_input_dp_replicate(
             get_parallel().tp_group,
             disabled=not is_allocation_symmetric(),
         ):
-            hidden_states, residual = residual_ops.update_and_read_ffn_input(
-                hidden_states, residual, layernorm
+            hidden_states, residual = read.update_and_read(
+                update, hidden_states, residual, layernorm
             )
     else:
-        hidden_states, residual = residual_ops.update_and_read_ffn_input(
-            hidden_states, residual, layernorm
+        hidden_states, residual = read.update_and_read(
+            update, hidden_states, residual, layernorm
         )
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
     return (
@@ -398,9 +400,10 @@ def _mlp_input_norm(
     layernorm: torch.nn.Module,
     context: CommunicateContext,
     *,
-    residual_ops: ResidualOps = ADD_AND_NORM,
+    read: StageRead = NORM_READ,
+    update: StageUpdate = ADD,
 ):
-    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
+    return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
 def _mlp_input_scatter(
@@ -411,14 +414,15 @@ def _mlp_input_scatter(
     context: CommunicateContext,
     *,
     scatters_residual: bool,
-    residual_ops: ResidualOps = ADD_AND_NORM,
+    read: StageRead = NORM_READ,
+    update: StageUpdate = ADD,
 ):
     hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(
         hidden_states, context
     )
     if scatters_residual:
-        residual = residual_ops.residual_to_attn_tp_shard(residual, context)
-    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
+        residual = update.residual_to_attn_tp_shard(residual, context)
+    return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
 def _mlp_input_on_residual_shard(
@@ -428,7 +432,8 @@ def _mlp_input_on_residual_shard(
     layernorm: torch.nn.Module,
     context: CommunicateContext,
     *,
-    residual_ops: ResidualOps,
+    read: StageRead,
+    update: StageUpdate,
 ):
     """The residual stays on each rank's slice while the FFN takes the full
     rows: reduce-scatter the attention output onto the slice, which completes
@@ -438,7 +443,7 @@ def _mlp_input_on_residual_shard(
         return hidden_states, hidden_states
     shard = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
     get_parallel().tp_group.reduce_scatter_tensor(shard, hidden_states)
-    shard, residual = residual_ops.update_and_read_ffn_input(shard, residual, layernorm)
+    shard, residual = read.update_and_read(update, shard, residual, layernorm)
     attn_tp_all_gather_into_tensor(hidden_states, shard)
     return hidden_states, residual
 
@@ -649,10 +654,10 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-        residual_ops: ResidualOps = ADD_AND_NORM,
+        update: StageUpdate = ADD,
         **kwargs,
     ):
-        hidden_states = residual_ops.update_residual(hidden_states, residual)
+        hidden_states = update.update(hidden_states, residual)
         return _redistribute_from_attn_tp_shards(hidden_states), None
 
     @staticmethod
@@ -664,7 +669,7 @@ class CommunicateSummableTensorPairFn:
         *,
         sums: bool,
         gathers_back: bool,
-        residual_ops: ResidualOps,
+        update: StageUpdate,
         **kwargs,
     ):
         """Bring the FFN output onto the slice of the rows the residual is on:
@@ -677,7 +682,7 @@ class CommunicateSummableTensorPairFn:
             hidden_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         if not gathers_back:
             return hidden_states, residual
-        local_states = residual_ops.update_residual(hidden_states, residual)
+        local_states = update.update(hidden_states, residual)
         hidden_states = local_states.new_empty(
             local_states.shape[0] * context.tp_size, *local_states.shape[1:]
         )

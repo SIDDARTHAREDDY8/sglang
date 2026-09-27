@@ -487,7 +487,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
 
     def assert_step(self, step, func, communicator, **keywords):
         self.assertIs(step.func, func)
-        self.assertIs(step.keywords["residual_ops"], communicator.mhc)
+        residual = communicator._residual
+        if "read" in step.keywords:
+            # The FFN input: the attention output's hc_post, then the FFN's read.
+            self.assertIs(step.keywords["read"], residual.ffn_read)
+            self.assertIs(step.keywords["update"], residual.attention_update)
+        else:
+            # The FFN output's move: its hc_post.
+            self.assertIs(step.keywords["update"], residual.ffn_update)
         for key, value in keywords.items():
             self.assertEqual(step.keywords[key], value, key)
 
@@ -1136,10 +1143,13 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     def unbound(self, steps):
         """``steps`` with the plain residual's binding taken off the FFN input
         and the attention input, whose input owes nothing in the region."""
-        self.assertEqual(steps.ffn_input.keywords, {"residual_ops": comm.ADD_AND_NORM})
+        self.assertEqual(
+            steps.ffn_input.keywords, {"read": comm.NORM_READ, "update": comm.ADD}
+        )
         attention = steps.attention_prepare.keywords
         self.assertIsNone(attention["layer_input"])
-        self.assertIs(attention["residual_ops"], comm.ADD_AND_NORM)
+        self.assertIs(attention["read"], comm.NORM_QUANT_READ)
+        self.assertIs(attention["update"], comm.ADD)
         return msgspec.structs.replace(
             steps,
             ffn_input=steps.ffn_input.func,
